@@ -7,7 +7,8 @@ public:
     // 单例接口
     static CentralCache *GetInstance()
     {
-        return &_sInst;
+        static CentralCache inst;
+        return &inst;
     }
 
     // CentralCache 从自己的 _spanLists 中为 ThreadCache 提供所需的块空间
@@ -28,5 +29,4 @@ private:
     CentralCache(const CentralCache &copy) = delete;
     CentralCache &operator=(const CentralCache &copy) = delete;
     SpanList _spanLists[FREE_LIST_NUM]; // 哈希桶中挂的是一个个Span
-    static CentralCache _sInst;         // 饿汉模式创建一个全局单例 CentralCache
 };

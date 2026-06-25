@@ -1,7 +1,5 @@
 #include "PageCache.h"
 
-PageCache PageCache::_sInst; // 单例对象
-
 Span *PageCache::NewSpan(size_t k)
 {
     // 申请页数一定在[1, PAGE_NUM - 1] 范围内
@@ -13,6 +11,7 @@ Span *PageCache::NewSpan(size_t k)
         Span *bigSpan = _spanPool.New();
         bigSpan->_pageID = ((PageID)ptr) >> PAGE_SHIFT;
         bigSpan->_n = k;
+        bigSpan->_isUse = true;
         // _idSpanMap[bigSpan->_pageID] = bigSpan;
         _idSpanMap.set(bigSpan->_pageID, bigSpan);
         return bigSpan;
@@ -79,6 +78,63 @@ Span *PageCache::NewSpan(size_t k)
     _spanLists[PAGE_NUM - 1].PushFront(bigSpan);
 
     return NewSpan(k); // 此时PageCache至少有一个128页的span 递归走②
+}
+
+Span *PageCache::NewAligned(size_t k, size_t alignPages)
+{
+    assert(k > 0);
+    assert(alignPages > 0);
+    assert((alignPages & (alignPages - 1)) == 0);
+
+    // gperftools 的做法是多申请一些页，然后把前后多余部分切下来归还。
+    // 这样返回给用户的地址依然是 Span 起点，而不是某个块内部的偏移地址。
+    if (k + alignPages < k)
+    {
+        return nullptr;
+    }
+
+    Span *span = NewSpan(k + alignPages);
+    if (span == nullptr)
+    {
+        return nullptr;
+    }
+
+    PageID alignedPageID = SizeClass::_RoundUp(span->_pageID, alignPages);
+    size_t leading = alignedPageID - span->_pageID;
+
+    if (leading > 0)
+    {
+        Span *leadingSpan = _spanPool.New();
+        leadingSpan->_pageID = span->_pageID;
+        leadingSpan->_n = leading;
+        leadingSpan->_isUse = false;
+
+        span->_pageID += leading;
+        span->_n -= leading;
+        ReleaseSpanToPageCache(leadingSpan);
+    }
+
+    assert(span->_n >= k);
+    size_t trailing = span->_n - k;
+    if (trailing > 0)
+    {
+        Span *trailingSpan = _spanPool.New();
+        trailingSpan->_pageID = span->_pageID + k;
+        trailingSpan->_n = trailing;
+        trailingSpan->_isUse = false;
+
+        span->_n = k;
+        ReleaseSpanToPageCache(trailingSpan);
+    }
+
+    span->_isUse = true;
+    span->_freeList = nullptr;
+    span->use_count = 0;
+    for (PageID i = 0; i < span->_n; ++i)
+    {
+        _idSpanMap.set(span->_pageID + i, span);
+    }
+    return span;
 }
 
 // 通过页地址找span

@@ -1,9 +1,6 @@
 #include "CentralCache.h"
 #include "PageCache.h"
 
-// 需要在类外cpp初始化单例 否则多次包含h文件重复声明
-CentralCache CentralCache::_sInst; // CentralCache的饿汉对象
-
 size_t CentralCache::FetchRangeObj(void *&start, void *&end, size_t batchNum, size_t size)
 {
     // 获取到size对应哪一个SpanList

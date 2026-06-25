@@ -13,10 +13,12 @@
 #include <thread>
 #include <mutex>
 #include <algorithm>
+#include <cstddef>
+#include <new>
 using std::cout;
 using std::endl;
 
-static const size_t FREE_LIST_NUM = 208;    // 哈希表中自由链表个数
+static const size_t FREE_LIST_NUM = 200;    // 哈希表中自由链表个数
 static const size_t MAX_BYTES = 256 * 1024; // ThreadCache 单次申请的最大字节数
 static const size_t PAGE_NUM = 129;         // span的最大管理页数
 #ifdef _WIN32
@@ -24,6 +26,36 @@ static const size_t PAGE_SHIFT = 13; // 一页13位 - 8KB
 #else
 static const size_t PAGE_SHIFT = 12;
 #endif
+static const size_t DEFAULT_ALIGN = alignof(std::max_align_t);
+static_assert(DEFAULT_ALIGN == 16, "This size class layout expects 16-byte default alignment");
+
+// 直接向操作系统申请 kpage 个页。内部元数据只能走这里，不能走 malloc/new，
+// 否则在替换全局 malloc/new 后会产生递归调用。
+inline static void *SystemAlloc(size_t kpage)
+{
+#ifdef _WIN32
+    void *ptr = VirtualAlloc(0, kpage << PAGE_SHIFT, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    // linux 下使用 mmap 映射匿名私有内存
+    void *ptr = mmap(nullptr, kpage << PAGE_SHIFT, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
+#ifdef _WIN32
+    if (ptr == nullptr)
+#else
+    if (ptr == MAP_FAILED)
+#endif
+        throw std::bad_alloc();
+    return ptr;
+}
+
+inline static void SystemFree(void *ptr, size_t kpage)
+{
+#ifdef _WIN32
+    VirtualFree(ptr, 0, MEM_RELEASE); // Win 下释放内存无需传入大小
+#else
+    munmap(ptr, kpage << PAGE_SHIFT); // Linux 下 munmap 需要传入释放的字节数
+#endif
+}
 
 /* 返回指向传入地址指针字节数的指针 */
 /* 自动适配系统位数 64位-8bit 32位-4bit */
@@ -106,8 +138,8 @@ public:
     static size_t RoundUp(size_t size)
     {
         if (size <= 128)
-        { // [1, 128] 8B对齐
-            return _RoundUp(size, 8);
+        { // [1, 128] 16B对齐，满足标准 malloc/new 的默认对齐要求
+            return _RoundUp(size, DEFAULT_ALIGN);
         }
         else if (size <= 1024)
         { // [128 + 1, 1024] 16B对齐
@@ -158,10 +190,10 @@ public:
     {
         assert(size <= MAX_BYTES);
 
-        static int group_array[4] = {16, 56, 56, 56}; // 代表每段哈希桶内链表个数
+        static int group_array[4] = {8, 56, 56, 56}; // 代表每段哈希桶内链表个数
         if (size <= 128)
-        { // [1, 128] 8B --> 2^3B --> align_shift = 3
-            return _Index(size, 3);
+        { // [1, 128] 16B --> 2^4B --> align_shift = 4
+            return _Index(size, 4);
         }
         else if (size <= 1024)
         {
@@ -253,8 +285,10 @@ class SpanList
 public:
     SpanList()
     {
-        // 构造函数中哨兵位头节点
-        _head = new Span;
+        // 构造函数中创建哨兵位头节点。
+        // 这里不能使用全局 new：本项目会导出 operator new 来替换标准库，
+        // 如果内部元数据也走 new，库初始化期间可能递归进入内存池。
+        _head = new (SystemAlloc(1)) Span;
 
         // 双向循环 都指向 _head
         _head->_next = _head;
@@ -318,26 +352,3 @@ private:
     Span *_head;
     std::mutex _mtx; // 每个CentralCache中的哈希桶都需要一个桶锁
 };
-
-// 向系统申请 kpage * 8KB 的堆内存
-inline static void *SystemAlloc(size_t kpage)
-{
-#ifdef _WIN32
-    void *ptr = VirtualAlloc(0, kpage << PAGE_SHIFT, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#else
-    // linux 下使用 mmap 映射匿名私有内存
-    void *ptr = mmap(nullptr, kpage << PAGE_SHIFT, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-#endif
-    if (ptr == nullptr)
-        throw std::bad_alloc();
-    return ptr;
-}
-
-inline static void SystemFree(void *ptr, size_t kpage)
-{
-#ifdef _WIN32
-    VirtualFree(ptr, 0, MEM_RELEASE); // Win 下释放内存无需传入大小
-#else
-    munmap(ptr, kpage << PAGE_SHIFT); // Linux 下 munmap 需要传入释放的字节数
-#endif
-}
