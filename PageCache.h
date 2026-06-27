@@ -14,7 +14,7 @@ public:
     }
 
     // PageCache 从 _spanLists 中拿出一个k页的span
-    Span *NewSpan(size_t k);
+    Span *NewSpan(size_t k, SpanState targetState);
 
     // 返回一个起始地址满足 alignPages 页对齐的 span。
     // 该接口用于 alignment > page_size 的标准对齐分配，返回值本身就是用户指针起点。

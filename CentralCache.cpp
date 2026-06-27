@@ -17,6 +17,7 @@ size_t CentralCache::FetchRangeObj(void *&start, void *&end, size_t batchNum, si
     _spanLists[index].getMtx().lock(); // 给对应桶加锁
     Span *span = GetOneSpan(_spanLists[index], size);
     assert(span);
+    assert(span->_state == SpanState::Small);
     assert(span->_freeList); // span 和 span 的管理空间不能为空
     end = start = span->_freeList;
     size_t actualNum = 1; // 函数实际返回值
@@ -28,7 +29,7 @@ size_t CentralCache::FetchRangeObj(void *&start, void *&end, size_t batchNum, si
         actualNum++;
     }
     span->_freeList = ObjNext(end);      // 将span指向的自由链表头节点设置为end后面的节点
-    span->use_count += actualNum;        // 给 ThreadCache 分了多少就加多少
+    span->use_count += actualNum;        // Small Span 给 ThreadCache 分了多少就加多少
     ObjNext(end) = nullptr;              // 将end指向的下一个节点设置为空
     _spanLists[index].getMtx().unlock(); // 解锁
     /*****************************************/
@@ -61,9 +62,10 @@ Span *CentralCache::GetOneSpan(SpanList &list, size_t size)
     size_t k = SizeClass::NumMovePage(size);
     // 调用NewSpan获取一个全新span
     PageCache::GetInstance()->GetMtx().lock();
-    Span *span = PageCache::GetInstance()->NewSpan(k);
+    Span *span = PageCache::GetInstance()->NewSpan(k, SpanState::Small);
+    assert(span->_state == SpanState::Small);
     span->_objSize = size;
-    // span->_isUse = true; // 标记该span已修改
+    span->use_count = 0;
     PageCache::GetInstance()->GetMtx().unlock();
     // 此时旧从PageCache中获取到一个 没有划分过 的全新span
     // 此时需要根据size划分该获取的span
@@ -101,15 +103,18 @@ void CentralCache::ReleaseListToSpans(void *start, size_t size)
     {
         void *next = ObjNext(start);
         Span *span = PageCache::GetInstance()->MapObjectToSpan(start); // 哈希表获取对应span
+        assert(span->_state == SpanState::Small);
 
         // 将 start 为首的内存块头插至 span 的自由链表中
         ObjNext(start) = span->_freeList;
         span->_freeList = start;
 
-        // 记录span中已使用的块个数
-        span->use_count--;
+        // use_count 是 Small Span 的 outstanding slot 计数，不是类型标记。
+        assert(span->use_count > 0);
+        --span->use_count;
         if (span->use_count == 0)
         {
+            // Small Span outstanding 已归零，沿用当前 CentralCache -> PageCache 回收流程。
             // 在 CentralCache 中删除span
             _spanLists[index].Erase(span);
             span->_freeList = nullptr; // 归还时顺序被打乱 _freeList无用  _pageID和_n

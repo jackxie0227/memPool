@@ -1,20 +1,22 @@
 #include "ConcurrentAlloc.h"
 
+#include <cstdlib>
+
 thread_local ThreadCache *pTLSThreadCache = nullptr;
 
 namespace
 {
-ThreadCache *GetThreadCache()
-{
-    if (pTLSThreadCache == nullptr)
+    ThreadCache *GetThreadCache()
     {
-        static ObjectPool<ThreadCache> objPool;
-        objPool.getMtx().lock();
-        pTLSThreadCache = objPool.New();
-        objPool.getMtx().unlock();
+        if (pTLSThreadCache == nullptr)
+        {
+            static ObjectPool<ThreadCache> objPool;
+            objPool.getMtx().lock();
+            pTLSThreadCache = objPool.New();
+            objPool.getMtx().unlock();
+        }
+        return pTLSThreadCache;
     }
-    return pTLSThreadCache;
-}
 }
 
 void *tcmalloc(size_t size)
@@ -30,9 +32,12 @@ void *tcmalloc(size_t size)
         size_t k = alignSize >> PAGE_SHIFT;          // 对齐后需要多少页
 
         PageCache::GetInstance()->GetMtx().lock();
-        Span *span = PageCache::GetInstance()->NewSpan(k);
+        Span *span = PageCache::GetInstance()->NewSpan(k, SpanState::Direct);
         // 页级分配没有切成小对象，use_count 保持 0。
         // _objSize 记录可用空间大小，realloc 可直接用它作为旧块容量。
+        assert(span->_state == SpanState::Direct);
+        span->use_count = 0;
+        span->_freeList = nullptr;
         span->_objSize = span->_n << PAGE_SHIFT;
         PageCache::GetInstance()->GetMtx().unlock();
 
@@ -44,22 +49,27 @@ void *tcmalloc(size_t size)
 
 void tcfree(void *ptr)
 {
+    // 空指针直接返回
     if (ptr == nullptr)
     {
         return;
     }
 
     Span *span = PageCache::GetInstance()->MapObjectToSpan(ptr);
-    if (span->use_count == 0)
+    if (span->_state == SpanState::Small)
     {
-        // use_count == 0 表示这是直接从 PageCache 分配的整页 Span，
-        // 包括大对象和大 alignment 分配。用户指针就是 Span 起点。
+        GetThreadCache()->Deallocate(ptr, span->_objSize);
+    }
+    else if (span->_state == SpanState::Direct)
+    {
+        // 本阶段不做 Direct Span 起始地址完整校验。
         PageCache::GetInstance()->GetMtx().lock();
         PageCache::GetInstance()->ReleaseSpanToPageCache(span);
         PageCache::GetInstance()->GetMtx().unlock();
     }
     else
     {
-        GetThreadCache()->Deallocate(ptr, span->_objSize);
+        assert(false && "invalid span state for free");
+        abort();
     }
 }

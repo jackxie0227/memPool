@@ -14,6 +14,7 @@
 #include <mutex>
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <new>
 using std::cout;
 using std::endl;
@@ -266,19 +267,62 @@ public:
 // CentralCache 向操作系统申请内存时，页号类型
 // size_t 大小随平台位数变化 32位-4byte 64位-8byte
 typedef size_t PageID;
+
+enum class SpanState : uint8_t
+{
+    Free,   // On a PageCache free Span list; may be split or coalesced.
+    Small,  // Split into fixed-size slots and managed by CentralCache.
+    Direct  // Page-level allocation handed directly to the user.
+};
+
 struct Span
 {
 public:
-    PageID _pageID = 0;        // 页号
-    size_t _n = 0;             // 当前 span 管理的页数
-    void *_freeList = nullptr; // 每个 span 下挂的小块空间的头节点
-    size_t use_count = 0;      // 当前 span 被分配出去的小块空间数
+    PageID _pageID = 0;        // 起始页号
+    size_t _n = 0;             // 管理的页数
+    SpanState _state = SpanState::Free;
+    void *_freeList = nullptr; // 下挂的小块空间的头节点
+
+    // Only meaningful when _state == SpanState::Small.
+    //
+    // Number of slots that have left this Small Span's CentralCache freelist.
+    // Those slots may be held by ThreadCache or user code.
+    //
+    // This is NOT a Span type marker. In particular, a zero use_count does
+    // NOT mean Direct or Free.
+    size_t use_count = 0;
     Span *_next = nullptr;     // 双向链表指针
     Span *_prev = nullptr;
 
-    bool _isUse = false;
     size_t _objSize = 0; // span管理页被切分成的块有多大
+
+    void Reset(PageID pageId, size_t pageCount, SpanState state) noexcept
+    {
+        _pageID = pageId;
+        _n = pageCount;
+        _state = state;
+        _freeList = nullptr;
+        use_count = 0;
+        _next = nullptr;
+        _prev = nullptr;
+        _objSize = 0;
+    }
 };
+
+inline size_t SpanUsableSize(const Span *span)
+{
+    switch (span->_state)
+    {
+    case SpanState::Direct:
+        return span->_n << PAGE_SHIFT;
+    case SpanState::Small:
+        return span->_objSize;
+    case SpanState::Free:
+    default:
+        assert(false && "invalid span state for usable size");
+        return 0;
+    }
+}
 
 class SpanList
 {

@@ -23,10 +23,6 @@ public:
                 _remanentBytes = 128 * 1024; // 新开辟 128K 的空间
                 // _memory = (char*)malloc(_remanentBytes);
                 _memory = (char *)SystemAlloc(_remanentBytes >> PAGE_SHIFT); // 右移13位 = 除以2^13 = 需要申请的页数
-                if (_memory == nullptr)
-                { // 内存不足时malloc返回空指针，抛出异常
-                    throw std::bad_alloc();
-                }
             }
 
             obj = (T *)_memory;                                                       // 给定一个T类型大小

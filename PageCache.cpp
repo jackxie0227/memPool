@@ -1,17 +1,16 @@
 #include "PageCache.h"
 
-Span *PageCache::NewSpan(size_t k)
+Span *PageCache::NewSpan(size_t k, SpanState targetState)
 {
     // 申请页数一定在[1, PAGE_NUM - 1] 范围内
     assert(k > 0);
+    assert(targetState == SpanState::Small || targetState == SpanState::Direct);
 
     if (k >= PAGE_NUM)
     {
         void *ptr = SystemAlloc(k);
         Span *bigSpan = _spanPool.New();
-        bigSpan->_pageID = ((PageID)ptr) >> PAGE_SHIFT;
-        bigSpan->_n = k;
-        bigSpan->_isUse = true;
+        bigSpan->Reset(((PageID)ptr) >> PAGE_SHIFT, k, targetState);
         // _idSpanMap[bigSpan->_pageID] = bigSpan;
         _idSpanMap.set(bigSpan->_pageID, bigSpan);
         return bigSpan;
@@ -21,6 +20,12 @@ Span *PageCache::NewSpan(size_t k)
     if (!_spanLists[k].Empty())
     {
         Span *span = _spanLists[k].PopFront();
+        span->_state = targetState;
+        span->_freeList = nullptr;
+        span->use_count = 0;
+        span->_objSize = 0;
+        span->_prev = nullptr;
+        span->_next = nullptr;
 
         // 记录哈希页号-span* 的哈希映射
         for (PageID i = 0; i < span->_n; ++i)
@@ -28,7 +33,6 @@ Span *PageCache::NewSpan(size_t k)
             // _idSpanMap[span->_pageID + i] = span;
             _idSpanMap.set(span->_pageID + i, span);
         }
-        span->_isUse = true; // 标记该块已使用
         return span;
     }
 
@@ -42,10 +46,13 @@ Span *PageCache::NewSpan(size_t k)
             // 将该span切分为一个k页的和一个 n-k 页的
             // Span* kSpan = new Span;
             Span *kSpan = _spanPool.New();
-            kSpan->_pageID = nSpan->_pageID;
-            kSpan->_n = k;
+            kSpan->Reset(nSpan->_pageID, k, targetState);
             nSpan->_pageID = kSpan->_pageID + k;
             nSpan->_n -= k;
+            nSpan->_state = SpanState::Free;
+            nSpan->_freeList = nullptr;
+            nSpan->use_count = 0;
+            nSpan->_objSize = 0;
             // 将 n-k 页放回对应哈希桶中
             _spanLists[nSpan->_n].PushFront(nSpan);
 
@@ -62,7 +69,6 @@ Span *PageCache::NewSpan(size_t k)
                 // _idSpanMap[kSpan->_pageID + i] = kSpan;
                 _idSpanMap.set(kSpan->_pageID + i, kSpan);
             }
-            kSpan->_isUse = true; // 标记该span已使用
             return kSpan;
         }
     }
@@ -72,14 +78,15 @@ Span *PageCache::NewSpan(size_t k)
     void *ptr = SystemAlloc(PAGE_NUM - 1);
     // 开一个新的span维护这块空间
     Span *bigSpan = _spanPool.New();
-    bigSpan->_pageID = ((PageID)ptr) >> PAGE_SHIFT;
-    bigSpan->_n = PAGE_NUM - 1;
+    bigSpan->Reset(((PageID)ptr) >> PAGE_SHIFT, PAGE_NUM - 1, SpanState::Free);
     // 将该span放到对应哈希桶中
     _spanLists[PAGE_NUM - 1].PushFront(bigSpan);
 
-    return NewSpan(k); // 此时PageCache至少有一个128页的span 递归走②
+    return NewSpan(k, targetState); // 此时PageCache至少有一个128页的span 递归走②
 }
 
+// 申请k页内存 需要确保按照alignPages页对齐
+// 页对齐时也可以表示为分配内存起始页号为对齐页数的倍数
 Span *PageCache::NewAligned(size_t k, size_t alignPages)
 {
     assert(k > 0);
@@ -88,46 +95,54 @@ Span *PageCache::NewAligned(size_t k, size_t alignPages)
 
     // gperftools 的做法是多申请一些页，然后把前后多余部分切下来归还。
     // 这样返回给用户的地址依然是 Span 起点，而不是某个块内部的偏移地址。
-    if (k + alignPages < k)
+    if (k + alignPages < k) // 防止加法溢出
     {
         return nullptr;
     }
 
-    Span *span = NewSpan(k + alignPages);
+    // 只申请k页时起始页号不一定满足对齐要求
+    // 申请k+alignPages页则其中一定有k页满足对齐要求
+    Span *span = NewSpan(k + alignPages, SpanState::Direct); // 申请 k+alignPages 页
     if (span == nullptr)
     {
         return nullptr;
     }
 
+    // 获取起始对齐的页号 alignedPageID
     PageID alignedPageID = SizeClass::_RoundUp(span->_pageID, alignPages);
-    size_t leading = alignedPageID - span->_pageID;
 
+    // 起始页号前有前导页
+    size_t leading = alignedPageID - span->_pageID;
     if (leading > 0)
     {
+        // 新建 Span 管理前导页并归还到 PageCache
         Span *leadingSpan = _spanPool.New();
-        leadingSpan->_pageID = span->_pageID;
-        leadingSpan->_n = leading;
-        leadingSpan->_isUse = false;
+        leadingSpan->Reset(span->_pageID, leading, SpanState::Free);
+        ReleaseSpanToPageCache(leadingSpan);
 
+        // 更新当前 Span 起始页号
         span->_pageID += leading;
         span->_n -= leading;
-        ReleaseSpanToPageCache(leadingSpan);
     }
 
     assert(span->_n >= k);
+
+    // 尾部有多余页
     size_t trailing = span->_n - k;
     if (trailing > 0)
     {
+        // 新建 Span 管理尾部多余页并保存到 PageCache 中
         Span *trailingSpan = _spanPool.New();
-        trailingSpan->_pageID = span->_pageID + k;
-        trailingSpan->_n = trailing;
-        trailingSpan->_isUse = false;
-
-        span->_n = k;
+        trailingSpan->Reset(span->_pageID + k, trailing, SpanState::Free);
         ReleaseSpanToPageCache(trailingSpan);
+
+        // 更新 span 管理的页数 - k
+        span->_n = k;
     }
 
-    span->_isUse = true;
+    // 返回前保持 Direct 状态。NewAligned 的临时 oversized Span 的 PageMap
+    // 生命周期在后续阶段统一收敛。
+    span->_state = SpanState::Direct;
     span->_freeList = nullptr;
     span->use_count = 0;
     for (PageID i = 0; i < span->_n; ++i)
@@ -163,6 +178,11 @@ Span *PageCache::MapObjectToSpan(void *obj)
 // 管理 CentralCache 还回来的span
 void PageCache::ReleaseSpanToPageCache(Span *span)
 {
+    span->_state = SpanState::Free;
+    span->use_count = 0;
+    span->_objSize = 0;
+    span->_freeList = nullptr;
+
     // 通过span判断释放空间页数是否大于128页
     // 大于128页时直接还给os
     if (span->_n > PAGE_NUM - 1)
@@ -190,8 +210,8 @@ void PageCache::ReleaseSpanToPageCache(Span *span)
 
         // Span* leftSpan = ret->second; // 获取相邻span
         Span *leftSpan = ret;
-        // 相邻span在cc中，停止合并
-        if (leftSpan->_isUse)
+        // 相邻span不在 PageCache 空闲链表中，停止合并
+        if (leftSpan->_state != SpanState::Free)
         {
             break;
         }
@@ -227,8 +247,8 @@ void PageCache::ReleaseSpanToPageCache(Span *span)
 
         Span *rightSpan = it;
         // Span* rightSpan = it;
-        // 相邻span在cc中，停止合并
-        if (rightSpan->_isUse)
+        // 相邻span不在 PageCache 空闲链表中，停止合并
+        if (rightSpan->_state != SpanState::Free)
         {
             break;
         }
@@ -249,7 +269,6 @@ void PageCache::ReleaseSpanToPageCache(Span *span)
 
     // 合并完毕，将当前span挂到对应桶中
     _spanLists[span->_n].PushFront(span);
-    span->_isUse = false; // 取消已使用标记
 
     // 映射当前span的边缘页 后续还可以对该span进行合并
     // _idSpanMap[span->_pageID] = span;

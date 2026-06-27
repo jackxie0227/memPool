@@ -259,7 +259,7 @@ raw span:
 1. `leading` 部分创建成一个空闲 `Span`，调用 `ReleaseSpanToPageCache` 归还。
 2. 中间的 `aligned user span` 保留为本次分配结果。
 3. `trailing` 部分也创建成空闲 `Span`，归还 PageCache。
-4. 对最终返回的 span 设置 `_isUse = true`、`use_count = 0`，并为它覆盖页号到 span 的映射。
+4. 对最终返回的 span 设置为 `SpanState::Direct`，并为它覆盖页号到 span 的映射。
 
 最终返回：
 
@@ -275,14 +275,14 @@ return (void *)(span->_pageID << PAGE_SHIFT);
 free(p)
     -> tcfree(p)
     -> PageCache::MapObjectToSpan(p)
-    -> span->use_count == 0
+    -> span->_state == SpanState::Direct
     -> PageCache::ReleaseSpanToPageCache(span)
 ```
 
-这里用 `use_count == 0` 区分页级分配和小对象分配：
+这里用 `SpanState::Direct` 区分页级分配和小对象分配：
 
-- 小对象 Span 被切成很多块，分出去的块会让 `use_count > 0`。
-- 页级分配没有切小块，整个 Span 直接给用户，所以 `use_count == 0`。
+- 小对象 Span 被切成很多块，状态为 `SpanState::Small`。
+- 页级分配没有切小块，整个 Span 直接给用户，状态为 `SpanState::Direct`。
 
 因此大 alignment 分配释放时不进入 `ThreadCache::Deallocate`，而是直接把整个 Span 归还给 PageCache。
 
