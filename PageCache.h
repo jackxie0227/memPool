@@ -41,6 +41,10 @@ private:
     PageCache() {} // 构造函数私有防止外部申请新的 PageCache 确保唯一性
     PageCache(const PageCache &pc) = delete;
     PageCache &operator=(const PageCache &pc) = delete;
+    // Requires _pageMtx to be held by the caller.
+    void MapSmallSpanPagesLocked(Span *span); // Locked 表示需要已持有 _pageMtx 的情况下调用
+    void MapDirectSpanBoundaryPagesLocked(Span *span);
+
 private:
     // 哈希映射 用于快速通过页号找到对应span
     // std::unordered_map<PageID, Span*> _idSpanMap;

@@ -199,3 +199,80 @@ ctest --test-dir build-no-tcmalloc-sim2 --output-on-failure
 - 未实现 ThreadCache Flush、完整 realloc 合法性验证、OOM 策略重构。
 - 未实现 hardened/debug allocator 能力，包括 allocation bitmap、redzone、
   canary、use-after-free 填充和 new/delete 类型匹配检测。
+
+## 阶段 3 - 最小必要版：修正 Small Span 与 Direct Span 的 PageMap 映射范围
+
+日期：2026-06-28
+
+### 修改文件
+
+- `PageCache.h`
+- `PageCache.cpp`
+- `CMakeLists.txt`
+- `test/span_pagemap_range_test.cpp`
+- `docs/refactor_progress.md`
+
+### 完成内容
+
+- 在 `PageCache` 内增加两个私有 helper：
+  - `MapSmallSpanPagesLocked(Span*)`：调用方需已经持有 PageCache 全局锁，
+    将 Small Span 覆盖的全部页映射到同一个 Span。
+  - `MapDirectSpanBoundaryPagesLocked(Span*)`：调用方需已经持有 PageCache
+    全局锁，只写入 Direct Span 的首页和尾页映射。
+- `PageCache::NewSpan()` 按 `targetState` 区分 PageMap 写入粒度：
+  - `SpanState::Small`：新建、复用、切分得到的 Span 均写入全部覆盖页。
+  - `SpanState::Direct`：新建、复用、切分得到的 Span 均只写入首尾页。
+- `PageCache::NewAligned()` 返回最终 Direct Span 前，只补写最终 Span 的
+  首尾页映射，不再主动对最终 Direct Span 全页循环 set；在归还 leading /
+  trailing Free Span 前，会先补写相邻的最终 Direct 边界页，避免既有合并路径
+  读到陈旧中间页映射后误合并活动 Direct Span。
+- 继续沿用当前 PageCache 全局锁保护 PageMap 写入；没有新增 PageMap 专用
+  mutex，没有引入无锁 PageMap read，也没有引入 gperftools 的 PageMap 快路径
+  缓存。
+- CMake 测试源路径改为当前工作区已有的 `test/` 目录，并新增阶段 3 最小
+  映射测试目标 `span_pagemap_range_test`。
+
+### 当前映射不变量
+
+- Small Span 的 `[startPage, startPage + pageCount - 1]` 全部页都会被
+  `_idSpanMap` 映射到该 Small Span。因此 Small Span 内任意页上的小对象，
+  都可以通过现有 `MapObjectToSpan()` 找回同一个 Span。
+- Direct Span 本阶段只主动写入首页和尾页映射；中间页不作为 Direct Span
+  定位能力的一部分。
+- Free Span 保持既有行为：归还、切分和合并路径仍只维护用于相邻合并的边界
+  页映射。本阶段没有引入 PageMap 清理语义。
+
+### 新增测试
+
+- `test/span_pagemap_range_test.cpp`
+  - 直接申请 3 页 Direct Span，验证首页和尾页映射到该 Span，中间页没有由
+    本次 Direct 分配映射到该 Span。
+  - 通过 200000 字节小对象分配构造多页 Small Span，验证首页、中间页和尾页
+    都映射到同一个 Small Span，并验证中间页地址能通过 `MapObjectToSpan()`
+    找回该 Span。
+
+### 验证结果
+
+- `cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug`：通过。
+- `cmake --build build -j`：通过。
+- `ctest --test-dir build --output-on-failure`：通过，
+  `3/3` 测试通过（`standard_alloc_test`、`span_state_test`、
+  `span_pagemap_range_test`）。
+- `rg -n "_idSpanMap\\.set|_idSpanMap\\.get|MapObjectToSpan|MapSmallSpanPages" .`：
+  新增写入集中在 PageCache 私有 helper；Free Span 首尾映射仍保留在既有路径。
+- `rg -n "SpanState::Small|SpanState::Direct" PageCache.cpp CentralCache.cpp ConcurrentAlloc.cpp`：
+  Small/Direct 状态分支覆盖 NewSpan、CentralCache 获取 Small Span 和
+  Direct 分配/释放路径。
+- PageMap 快路径缓存相关搜索：无命中。
+
+### 保持不变和已知限制
+
+- 未修改 `PageCache::NewSpan()`、`NewAligned()`、`ReleaseSpanToPageCache()`
+  的公开接口签名。
+- 未新增 `RegisterSmallSpan()`、`NewSpanLocked()` 或 PageMap 专用锁。
+- 未改变 malloc/free/realloc/new/delete 对外语义。
+- 未重构 Free Span 的切分、合并、首尾映射策略，也未实现 PageMap 完整生命
+  周期清理；旧的中间页陈旧映射仍留待后续阶段处理。
+- 未实现 metadata 删除前映射清理、Direct 起始地址校验、Direct double free、
+  Small slot 起始地址检查、CentralCache 生命周期重构、`_slotCount`、
+  ThreadCache Flush 或 realloc 完整合法性验证。

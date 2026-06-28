@@ -27,6 +27,7 @@ set(MEMPOOL_SOURCES
 add_library(mempool SHARED ${MEMPOOL_SOURCES})
 target_link_libraries(mempool PUBLIC Threads::Threads)
 target_compile_features(mempool PUBLIC cxx_std_17)
+target_include_directories(mempool PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(mempool_benchmark benchmark.cpp)
 target_link_libraries(mempool_benchmark PRIVATE mempool)
@@ -49,12 +50,16 @@ else()
     message(STATUS "tcmalloc library not found; skipping gperftools_benchmark")
 endif()
 
-add_executable(standard_alloc_test standard_alloc_test.cpp)
+add_executable(standard_alloc_test test/standard_alloc_test.cpp)
 target_link_libraries(standard_alloc_test PRIVATE mempool)
 add_test(NAME standard_alloc_test COMMAND standard_alloc_test)
 
-add_executable(span_state_test span_state_test.cpp)
+add_executable(span_state_test test/span_state_test.cpp)
 target_link_libraries(span_state_test PRIVATE mempool)
 add_test(NAME span_state_test COMMAND span_state_test)
 
-add_executable(standard_alloc_plain standard_alloc_test.cpp)
+add_executable(span_pagemap_range_test test/span_pagemap_range_test.cpp)
+target_link_libraries(span_pagemap_range_test PRIVATE mempool)
+add_test(NAME span_pagemap_range_test COMMAND span_pagemap_range_test)
+
+add_executable(standard_alloc_plain test/standard_alloc_test.cpp)

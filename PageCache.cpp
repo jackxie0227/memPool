@@ -1,18 +1,47 @@
 #include "PageCache.h"
 
+void PageCache::MapSmallSpanPagesLocked(Span *span)
+{
+    assert(span != nullptr);
+    assert(span->_state == SpanState::Small);
+    for (PageID i = 0; i < span->_n; ++i)
+    {
+        _idSpanMap.set(span->_pageID + i, span);
+    }
+}
+
+void PageCache::MapDirectSpanBoundaryPagesLocked(Span *span)
+{
+    assert(span != nullptr);
+    assert(span->_state == SpanState::Direct);
+    _idSpanMap.set(span->_pageID, span);
+    if (span->_n > 1)
+    {
+        _idSpanMap.set(span->_pageID + span->_n - 1, span);
+    }
+}
+
 Span *PageCache::NewSpan(size_t k, SpanState targetState)
 {
     // 申请页数一定在[1, PAGE_NUM - 1] 范围内
     assert(k > 0);
     assert(targetState == SpanState::Small || targetState == SpanState::Direct);
 
+    // 申请页数超过PageCache可容纳的最大页数(128)
+    // 直接向OS申请
     if (k >= PAGE_NUM)
     {
         void *ptr = SystemAlloc(k);
         Span *bigSpan = _spanPool.New();
         bigSpan->Reset(((PageID)ptr) >> PAGE_SHIFT, k, targetState);
-        // _idSpanMap[bigSpan->_pageID] = bigSpan;
-        _idSpanMap.set(bigSpan->_pageID, bigSpan);
+        if (targetState == SpanState::Small)
+        {
+            MapSmallSpanPagesLocked(bigSpan);
+        }
+        else
+        {
+            MapDirectSpanBoundaryPagesLocked(bigSpan);
+        }
         return bigSpan;
     }
 
@@ -27,11 +56,13 @@ Span *PageCache::NewSpan(size_t k, SpanState targetState)
         span->_prev = nullptr;
         span->_next = nullptr;
 
-        // 记录哈希页号-span* 的哈希映射
-        for (PageID i = 0; i < span->_n; ++i)
+        if (targetState == SpanState::Small)
         {
-            // _idSpanMap[span->_pageID + i] = span;
-            _idSpanMap.set(span->_pageID + i, span);
+            MapSmallSpanPagesLocked(span);
+        }
+        else
+        {
+            MapDirectSpanBoundaryPagesLocked(span);
         }
         return span;
     }
@@ -63,11 +94,13 @@ Span *PageCache::NewSpan(size_t k, SpanState targetState)
             _idSpanMap.set(nSpan->_pageID + nSpan->_n - 1, nSpan);
             // 映射边缘页后，在合并时可以通过 pageID-1 或 pageID+_n 找到
 
-            // 记录哈希映射关系 页地址-span*
-            for (size_t i = 0; i < kSpan->_n; i++)
+            if (targetState == SpanState::Small)
             {
-                // _idSpanMap[kSpan->_pageID + i] = kSpan;
-                _idSpanMap.set(kSpan->_pageID + i, kSpan);
+                MapSmallSpanPagesLocked(kSpan);
+            }
+            else
+            {
+                MapDirectSpanBoundaryPagesLocked(kSpan);
             }
             return kSpan;
         }
@@ -115,6 +148,9 @@ Span *PageCache::NewAligned(size_t k, size_t alignPages)
     size_t leading = alignedPageID - span->_pageID;
     if (leading > 0)
     {
+        // The leading Free Span must not coalesce with the active Direct range.
+        _idSpanMap.set(alignedPageID, span);
+
         // 新建 Span 管理前导页并归还到 PageCache
         Span *leadingSpan = _spanPool.New();
         leadingSpan->Reset(span->_pageID, leading, SpanState::Free);
@@ -131,6 +167,9 @@ Span *PageCache::NewAligned(size_t k, size_t alignPages)
     size_t trailing = span->_n - k;
     if (trailing > 0)
     {
+        // The trailing Free Span must not coalesce with the active Direct range.
+        _idSpanMap.set(span->_pageID + k - 1, span);
+
         // 新建 Span 管理尾部多余页并保存到 PageCache 中
         Span *trailingSpan = _spanPool.New();
         trailingSpan->Reset(span->_pageID + k, trailing, SpanState::Free);
@@ -145,10 +184,7 @@ Span *PageCache::NewAligned(size_t k, size_t alignPages)
     span->_state = SpanState::Direct;
     span->_freeList = nullptr;
     span->use_count = 0;
-    for (PageID i = 0; i < span->_n; ++i)
-    {
-        _idSpanMap.set(span->_pageID + i, span);
-    }
+    MapDirectSpanBoundaryPagesLocked(span);
     return span;
 }
 
