@@ -1,244 +1,460 @@
 #include <algorithm>
-#include <array>
 #include <chrono>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include <numeric>
+#include <new>
 #include <random>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <thread>
-#include <vector>
-
-using namespace std::chrono;
 
 namespace
 {
-    class Timer
+    constexpr double kTrialNSec = 0.3e9;
+
+    double benchmarkMinTimeNSec = 3.0e9;
+    int benchmarkRepetitions = 3;
+    bool benchmarkListOnly = false;
+    bool benchmarkSkipRandomize = false;
+    std::unique_ptr<std::regex> benchmarkFilter;
+
+    using BenchBody = void (*)(long iterations, uintptr_t param);
+
+    struct Benchmark
     {
-        high_resolution_clock::time_point start_;
-
-    public:
-        Timer() : start_(high_resolution_clock::now()) {}
-
-        double elapsed() const
-        {
-            auto end = high_resolution_clock::now();
-            return duration_cast<microseconds>(end - start_).count() / 1000.0;
-        }
+        BenchBody body;
+        uintptr_t param;
     };
 
-    struct SmallObject
+    size_t PointerSlotCapacity(size_t usedSlots)
     {
-        int id;
-        double score;
-        std::array<char, 48> payload;
-
-        explicit SmallObject(int value) : id(value), score(value * 0.25)
+        constexpr size_t kAllocatorBoundaryBytes = 256 * 1024;
+        if (usedSlots * sizeof(void *) == kAllocatorBoundaryBytes)
         {
-            payload.fill(static_cast<char>(value));
+            return usedSlots + 1;
         }
-    };
-
-    struct MediumObject
-    {
-        std::array<char, 512> payload;
-
-        explicit MediumObject(size_t seed)
-        {
-            payload.fill(static_cast<char>(seed));
-        }
-    };
-
-    struct alignas(64) CacheLineObject
-    {
-        std::array<char, 64> payload;
-
-        explicit CacheLineObject(size_t seed)
-        {
-            payload.fill(static_cast<char>(seed));
-        }
-    };
-
-    struct alignas(8192) PageAlignedObject
-    {
-        std::array<char, 8192> payload;
-
-        explicit PageAlignedObject(size_t seed)
-        {
-            payload.fill(static_cast<char>(seed));
-        }
-    };
-
-    void PrintResult(const char *name, double ms)
-    {
-        std::cout << std::left << std::setw(32) << name << ": "
-                  << std::fixed << std::setprecision(3) << ms << " ms" << std::endl;
+        return usedSlots;
     }
 
-    void Warmup()
+    void PrintUsage(const char *program)
     {
-        std::vector<std::unique_ptr<SmallObject>> objects;
-        objects.reserve(5000);
-        for (int i = 0; i < 5000; ++i)
-        {
-            objects.emplace_back(std::make_unique<SmallObject>(i));
-        }
+        std::cout << program << " [benchmark flags]\n"
+                  << "  --help\n"
+                  << "  --benchmark_filter=<regex>\n"
+                  << "  --benchmark_list\n"
+                  << "  --benchmark_min_time=<seconds>\n"
+                  << "  --benchmark_repetitions=<count>\n"
+                  << "  --benchmark_skip_randomize\n";
     }
 
-    double MakeUniqueSmallObjects()
+    bool HasPrefix(const std::string &value, const char *prefix)
     {
-        constexpr size_t NUM_ALLOCS = 120000;
-        Timer t;
-        std::vector<std::unique_ptr<SmallObject>> objects;
-        objects.reserve(NUM_ALLOCS);
-
-        for (size_t i = 0; i < NUM_ALLOCS; ++i)
-        {
-            objects.emplace_back(std::make_unique<SmallObject>(static_cast<int>(i)));
-            if (i % 4 == 0)
-            {
-                objects.pop_back();
-            }
-        }
-        return t.elapsed();
+        const size_t prefixLen = std::strlen(prefix);
+        return value.size() >= prefixLen && value.compare(0, prefixLen, prefix) == 0;
     }
 
-    double MakeUniqueMixedObjects()
+    void InitBenchmark(int argc, char **argv)
     {
-        constexpr size_t NUM_ALLOCS = 60000;
-        Timer t;
-        std::vector<std::unique_ptr<SmallObject>> smallObjects;
-        std::vector<std::unique_ptr<MediumObject>> mediumObjects;
-        smallObjects.reserve(NUM_ALLOCS);
-        mediumObjects.reserve(NUM_ALLOCS / 4);
-
-        for (size_t i = 0; i < NUM_ALLOCS; ++i)
+        for (int i = 1; i < argc; ++i)
         {
-            smallObjects.emplace_back(std::make_unique<SmallObject>(static_cast<int>(i)));
-            if (i % 4 == 0)
+            const std::string arg(argv[i]);
+            if (arg == "--help")
             {
-                mediumObjects.emplace_back(std::make_unique<MediumObject>(i));
+                PrintUsage(argv[0]);
+                std::exit(0);
             }
-            if (i % 128 == 0 && !smallObjects.empty())
+            else if (arg == "--benchmark_list")
             {
-                size_t releaseCount = std::min(smallObjects.size(), size_t(32));
-                smallObjects.erase(smallObjects.end() - releaseCount, smallObjects.end());
+                benchmarkListOnly = true;
             }
-        }
-        return t.elapsed();
-    }
-
-    double VectorStringWorkload()
-    {
-        constexpr size_t NUM_ITEMS = 40000;
-        Timer t;
-        std::vector<std::string> strings;
-        strings.reserve(NUM_ITEMS);
-
-        for (size_t i = 0; i < NUM_ITEMS; ++i)
-        {
-            strings.emplace_back(24 + (i % 220), static_cast<char>('a' + (i % 26)));
-            if (i % 64 == 0)
+            else if (arg == "--benchmark_skip_randomize")
             {
-                strings.emplace_back(std::to_string(i) + "-allocation-heavy-string-payload");
+                benchmarkSkipRandomize = true;
             }
-            if (i % 256 == 0 && strings.size() > 128)
+            else if (HasPrefix(arg, "--benchmark_min_time="))
             {
-                strings.erase(strings.begin(), strings.begin() + 64);
-            }
-        }
-
-        size_t total = 0;
-        for (const auto &s : strings)
-        {
-            total += s.size();
-        }
-        // 防止优化器把字符串工作负载整体消掉。
-        if (total == 0)
-        {
-            std::cerr << "unexpected empty workload\n";
-        }
-        return t.elapsed();
-    }
-
-    double MultiThreadedUniquePtr()
-    {
-        const size_t numThreads = std::max(1u, std::thread::hardware_concurrency());
-        constexpr size_t ALLOCS_PER_THREAD = 30000;
-
-        auto threadFunc = [](size_t threadId)
-        {
-            std::mt19937 gen(static_cast<uint32_t>(0xBADC0DE + threadId));
-            std::uniform_int_distribution<int> percentDist(0, 99);
-            std::vector<std::unique_ptr<SmallObject>> objects;
-            objects.reserve(ALLOCS_PER_THREAD);
-
-            for (size_t i = 0; i < ALLOCS_PER_THREAD; ++i)
-            {
-                objects.emplace_back(std::make_unique<SmallObject>(static_cast<int>(i + threadId)));
-                if (percentDist(gen) < 75 && !objects.empty())
+                const char *value = arg.c_str() + std::strlen("--benchmark_min_time=");
+                char *end = nullptr;
+                const double seconds = std::strtod(value, &end);
+                if (end == value || *end != '\0' || seconds <= 0.0)
                 {
-                    size_t index = static_cast<size_t>(gen()) % objects.size();
-                    objects[index] = std::move(objects.back());
-                    objects.pop_back();
+                    std::cerr << "failed to parse benchmark_min_time argument: " << arg << '\n';
+                    std::exit(1);
+                }
+                benchmarkMinTimeNSec = seconds * 1e9;
+            }
+            else if (HasPrefix(arg, "--benchmark_repetitions="))
+            {
+                const char *value = arg.c_str() + std::strlen("--benchmark_repetitions=");
+                char *end = nullptr;
+                const long repetitions = std::strtol(value, &end, 0);
+                if (end == value || *end != '\0' || repetitions < 1 || repetitions > INT_MAX)
+                {
+                    std::cerr << "failed to parse benchmark_repetitions argument: " << arg << '\n';
+                    std::exit(1);
+                }
+                benchmarkRepetitions = static_cast<int>(repetitions);
+            }
+            else if (HasPrefix(arg, "--benchmark_filter="))
+            {
+                const char *pattern = arg.c_str() + std::strlen("--benchmark_filter=");
+                try
+                {
+                    benchmarkFilter = std::make_unique<std::regex>(pattern);
+                }
+                catch (const std::regex_error &e)
+                {
+                    std::cerr << "failed to parse benchmark_filter argument: " << e.what() << '\n';
+                    std::exit(1);
                 }
             }
+            else
+            {
+                std::cerr << "unknown benchmark flag: " << arg << '\n';
+                PrintUsage(argv[0]);
+                std::exit(1);
+            }
+        }
+    }
+
+    double MeasureOnce(const Benchmark &benchmark, long iterations)
+    {
+        const auto before = std::chrono::steady_clock::now();
+        benchmark.body(iterations, benchmark.param);
+        const auto after = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::nano>(after - before).count();
+    }
+
+    double RunBenchmark(const Benchmark &benchmark)
+    {
+        long iterations = 128;
+        double nsec = 0.0;
+
+        do
+        {
+            nsec = MeasureOnce(benchmark, iterations);
+            if (nsec > kTrialNSec)
+            {
+                break;
+            }
+            if (iterations > LONG_MAX / 2)
+            {
+                std::cerr << "benchmark iteration count overflow\n";
+                std::exit(1);
+            }
+            iterations <<= 1;
+        } while (true);
+
+        while (nsec < benchmarkMinTimeNSec)
+        {
+            const double targetIterations = iterations * benchmarkMinTimeNSec * 1.1 / nsec;
+            if (targetIterations > static_cast<double>(LONG_MAX))
+            {
+                std::cerr << "benchmark target iteration count overflow\n";
+                std::exit(1);
+            }
+            iterations = static_cast<long>(targetIterations);
+            if (iterations < 1)
+            {
+                iterations = 1;
+            }
+            nsec = MeasureOnce(benchmark, iterations);
+        }
+
+        return nsec / iterations;
+    }
+
+    std::string FullBenchmarkName(const char *name, uintptr_t param)
+    {
+        std::ostringstream fullName;
+        fullName << name;
+        if (param != 0)
+        {
+            fullName << '(' << param << ')';
+        }
+        return fullName.str();
+    }
+
+    void ReportBenchmark(const char *name, BenchBody body, uintptr_t param)
+    {
+        const std::string fullName = FullBenchmarkName(name, param);
+
+        if (benchmarkListOnly)
+        {
+            std::cout << "known benchmark: " << fullName << '\n';
+            return;
+        }
+
+        if (benchmarkFilter && !std::regex_search(fullName, *benchmarkFilter))
+        {
+            return;
+        }
+
+        const Benchmark benchmark{body, param};
+        for (int i = 0; i < benchmarkRepetitions; ++i)
+        {
+            std::cout << "Benchmark: " << std::left << std::setw(48) << fullName << std::right << std::flush;
+            const double nsec = RunBenchmark(benchmark);
+            std::cout << std::fixed << std::setprecision(3)
+                      << nsec << " nsec (rate: " << (1e9 / nsec / 1e6) << " Mops/sec)\n";
+        }
+    }
+
+    void BenchFastpathThroughput(long iterations, uintptr_t)
+    {
+        size_t size = 32;
+        for (; iterations > 0; --iterations)
+        {
+            void *ptr = operator new(size);
+            operator delete(ptr);
+            size = ((size * 8191) & 511) + 16;
+        }
+    }
+
+    void BenchFastpathDependent(long iterations, uintptr_t)
+    {
+        size_t size = 32;
+        for (; iterations > 0; --iterations)
+        {
+            const uintptr_t ptr = reinterpret_cast<uintptr_t>(operator new(size));
+            operator delete(reinterpret_cast<void *>(ptr));
+            size = ((size | static_cast<size_t>(ptr)) & 511) + 16;
+        }
+    }
+
+    void BenchFastpathSimple(long iterations, uintptr_t param)
+    {
+        const size_t size = static_cast<size_t>(param);
+        for (; iterations > 0; --iterations)
+        {
+            void *ptr = operator new(size);
+            operator delete(ptr);
+        }
+    }
+
+#if defined(__cpp_sized_deallocation)
+    void BenchFastpathSimpleSized(long iterations, uintptr_t param)
+    {
+        const size_t size = static_cast<size_t>(param);
+        for (; iterations > 0; --iterations)
+        {
+            void *ptr = operator new(size);
+            operator delete(ptr, size);
+        }
+    }
+#endif
+
+#if defined(__cpp_aligned_new)
+    void BenchFastpathMemalign(long iterations, uintptr_t param)
+    {
+        const size_t size = static_cast<size_t>(param);
+        constexpr std::align_val_t kAlign{32};
+        for (; iterations > 0; --iterations)
+        {
+            void *ptr = operator new(size, kAlign);
+            operator delete(ptr, size, kAlign);
+        }
+    }
+#endif
+
+    void BenchFastpathStack(long iterations, uintptr_t param)
+    {
+        size_t size = 64;
+        const long depth = std::max(1L, static_cast<long>(param));
+        auto stack = std::make_unique<void *[]>(PointerSlotCapacity(static_cast<size_t>(depth)));
+
+        for (; iterations > 0; iterations -= depth)
+        {
+            for (long k = depth - 1; k >= 0; --k)
+            {
+                void *ptr = operator new(size);
+                stack[static_cast<size_t>(k)] = ptr;
+                size = ((size | reinterpret_cast<size_t>(ptr)) & 511) + 16;
+            }
+            for (long k = 0; k < depth; ++k)
+            {
+                operator delete(stack[static_cast<size_t>(k)]);
+            }
+        }
+    }
+
+    void BenchFastpathStackSimple(long iterations, uintptr_t param)
+    {
+        constexpr size_t kSize = 32;
+        const long depth = std::max(1L, static_cast<long>(param));
+        auto stack = std::make_unique<void *[]>(PointerSlotCapacity(static_cast<size_t>(depth)));
+
+        for (; iterations > 0; iterations -= depth)
+        {
+            for (long k = depth - 1; k >= 0; --k)
+            {
+                stack[static_cast<size_t>(k)] = operator new(kSize);
+            }
+            for (long k = 0; k < depth; ++k)
+            {
+#if defined(__cpp_sized_deallocation)
+                operator delete(stack[static_cast<size_t>(k)], kSize);
+#else
+                operator delete(stack[static_cast<size_t>(k)]);
+#endif
+            }
+        }
+    }
+
+    void BenchFastpathRndDependent(long iterations, uintptr_t param)
+    {
+        constexpr uintptr_t kRndC = 1013904223;
+        constexpr uintptr_t kRndA = 1664525;
+
+        if ((param & (param - 1)) != 0)
+        {
+            std::cerr << "bench_fastpath_rnd_dependent param must be a power of two\n";
+            std::exit(1);
+        }
+
+        size_t size = 128;
+        const long count = std::max(1L, static_cast<long>(param));
+        auto ptrs = std::make_unique<void *[]>(PointerSlotCapacity(static_cast<size_t>(count)));
+
+        for (; iterations > 0; iterations -= count)
+        {
+            for (long k = count - 1; k >= 0; --k)
+            {
+                void *ptr = operator new(size);
+                ptrs[static_cast<size_t>(k)] = ptr;
+                size = ((size | reinterpret_cast<size_t>(ptr)) & 511) + 16;
+            }
+
+            uint32_t rnd = 0;
+            uint32_t freeIndex = 0;
+            do
+            {
+                operator delete(ptrs[freeIndex]);
+                rnd = rnd * kRndA + kRndC;
+                freeIndex = rnd & (static_cast<uint32_t>(count) - 1);
+            } while (freeIndex != 0);
+        }
+    }
+
+    void BenchFastpathRndDependent8Threads(long iterations, uintptr_t param)
+    {
+        auto body = [iterations, param]()
+        {
+            BenchFastpathRndDependent(iterations, param);
         };
 
-        Timer t;
-        std::vector<std::thread> threads;
-        for (size_t i = 0; i < numThreads; ++i)
-        {
-            threads.emplace_back(threadFunc, i);
-        }
+        std::thread threads[] = {
+            std::thread(body), std::thread(body), std::thread(body), std::thread(body),
+            std::thread(body), std::thread(body), std::thread(body), std::thread(body)};
+
         for (auto &thread : threads)
         {
             thread.join();
         }
-        return t.elapsed();
     }
 
-    double AlignedMakeUnique()
+    void RandomizeOneSizeClass(size_t size)
     {
-        constexpr size_t NUM_ALLOCS = 25000;
-        Timer t;
-        std::vector<std::unique_ptr<CacheLineObject>> cacheLineObjects;
-        std::vector<std::unique_ptr<PageAlignedObject>> pageAlignedObjects;
-        cacheLineObjects.reserve(NUM_ALLOCS);
-        pageAlignedObjects.reserve(NUM_ALLOCS / 16);
+        constexpr size_t kBytesPerSizeClass = 4 << 20;
+        constexpr size_t kMinObjects = 64;
+        constexpr size_t kMaxObjects = 65536;
 
-        for (size_t i = 0; i < NUM_ALLOCS; ++i)
+        size_t count = kBytesPerSizeClass / size;
+        count = std::max(kMinObjects, std::min(count, kMaxObjects));
+
+        auto objects = std::make_unique<void *[]>(count);
+        for (size_t i = 0; i < count; ++i)
         {
-            cacheLineObjects.emplace_back(std::make_unique<CacheLineObject>(i));
-            if (i % 16 == 0)
-            {
-                pageAlignedObjects.emplace_back(std::make_unique<PageAlignedObject>(i));
-            }
-            if (i % 64 == 0 && !cacheLineObjects.empty())
-            {
-                cacheLineObjects.pop_back();
-            }
-            if (i % 128 == 0 && !pageAlignedObjects.empty())
-            {
-                pageAlignedObjects.pop_back();
-            }
+            objects[i] = operator new(size);
         }
-        return t.elapsed();
+
+        std::minstd_rand random(static_cast<unsigned int>(size * 2654435761u));
+        std::shuffle(objects.get(), objects.get() + count, random);
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            operator delete(objects[i]);
+        }
+    }
+
+    void RandomizeSizeClasses()
+    {
+        RandomizeOneSizeClass(8);
+
+        int size = 16;
+        for (; size < 256; size += 16)
+        {
+            RandomizeOneSizeClass(static_cast<size_t>(size));
+        }
+        for (; size < 512; size += 32)
+        {
+            RandomizeOneSizeClass(static_cast<size_t>(size));
+        }
+        for (; size < 1024; size += 64)
+        {
+            RandomizeOneSizeClass(static_cast<size_t>(size));
+        }
+        for (; size < (4 << 10); size += 128)
+        {
+            RandomizeOneSizeClass(static_cast<size_t>(size));
+        }
+        for (; size < (32 << 10); size += 1024)
+        {
+            RandomizeOneSizeClass(static_cast<size_t>(size));
+        }
+    }
+
+    void RegisterBenchmarks()
+    {
+        ReportBenchmark("bench_fastpath_throughput", BenchFastpathThroughput, 0);
+        ReportBenchmark("bench_fastpath_dependent", BenchFastpathDependent, 0);
+        ReportBenchmark("bench_fastpath_simple", BenchFastpathSimple, 64);
+        ReportBenchmark("bench_fastpath_simple", BenchFastpathSimple, 2048);
+        ReportBenchmark("bench_fastpath_simple", BenchFastpathSimple, 16384);
+
+#if defined(__cpp_sized_deallocation)
+        ReportBenchmark("bench_fastpath_simple_sized", BenchFastpathSimpleSized, 64);
+        ReportBenchmark("bench_fastpath_simple_sized", BenchFastpathSimpleSized, 2048);
+#endif
+
+#if defined(__cpp_aligned_new)
+        ReportBenchmark("bench_fastpath_memalign", BenchFastpathMemalign, 64);
+        ReportBenchmark("bench_fastpath_memalign", BenchFastpathMemalign, 2048);
+#endif
+
+        for (uintptr_t depth = 8; depth <= 512; depth <<= 1)
+        {
+            ReportBenchmark("bench_fastpath_stack", BenchFastpathStack, depth);
+        }
+
+        ReportBenchmark("bench_fastpath_stack_simple", BenchFastpathStackSimple, 32);
+        ReportBenchmark("bench_fastpath_stack_simple", BenchFastpathStackSimple, 8192);
+        ReportBenchmark("bench_fastpath_stack_simple", BenchFastpathStackSimple, 32768);
+
+        ReportBenchmark("bench_fastpath_rnd_dependent", BenchFastpathRndDependent, 32);
+        ReportBenchmark("bench_fastpath_rnd_dependent", BenchFastpathRndDependent, 8192);
+        ReportBenchmark("bench_fastpath_rnd_dependent", BenchFastpathRndDependent, 32768);
+
+        ReportBenchmark("bench_fastpath_rnd_dependent_8threads", BenchFastpathRndDependent8Threads, 32768);
     }
 }
 
-int main()
+int main(int argc, char **argv)
 {
-    std::cout << "Benchmark mode: modern C++ allocation APIs" << std::endl;
-    std::cout << "Detected hardware threads: "
-              << std::max(1u, std::thread::hardware_concurrency()) << std::endl;
-    Warmup();
+    InitBenchmark(argc, argv);
 
-    PrintResult("make_unique small objects", MakeUniqueSmallObjects());
-    PrintResult("make_unique mixed objects", MakeUniqueMixedObjects());
-    PrintResult("vector<string> workload", VectorStringWorkload());
-    PrintResult("multi-thread unique_ptr", MultiThreadedUniquePtr());
-    PrintResult("aligned make_unique", AlignedMakeUnique());
+    if (!benchmarkListOnly && !benchmarkSkipRandomize)
+    {
+        std::cout << "Trying to randomize freelists..." << std::flush;
+        RandomizeSizeClasses();
+        std::cout << "done.\n";
+    }
+
+    RegisterBenchmarks();
     return 0;
 }
